@@ -1,0 +1,337 @@
+---
+title: "Kentucky Legislature Twitter Analysis"
+author: "Robert Kahne"
+date: "August 30, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(rtweet)
+library(jsonlite)
+library(tidytext)
+library(stringr)
+library(magrittr)
+library(ggalt)
+library(forcats)
+library(lubridate)
+library(treemap)
+
+ky_leg_json <- read_json('ky_legislators.json')
+legislators <- read_csv("https://query.data.world/s/UY947SPvDTwn5lyXSazhoNFC_pS2sv")
+crosswalk <- read_csv('twitter_db_crosswalk.csv')
+
+load('ky_leg_tweets.rda')
+
+ky_leg_follow <- tibble(
+  user_name = map_chr(ky_leg_json$users, function(i) i$screen_name),
+  followers = map_dbl(ky_leg_json$users, function(i) i$followers_count),
+  following = map_dbl(ky_leg_json$users, function(i) i$friends_count)
+) %>% 
+  inner_join(crosswalk, by = c('user_name' = 'twitter_screenname')) %>% 
+  left_join(legislators)
+
+ky_leg_filtered <- filter(ky_leg_tweets, tweets != '')
+
+unnested_tweets <- unnest(ky_leg_filtered) %>% 
+  select(user_name, lastunique, FirstName, LastName, District, Party, Race, Gender, First.Elected, text, retweet_count,
+         favorite_count, is_retweet, created_at) %>% 
+  mutate(date_created_at = as.Date(created_at)) %>% 
+  filter(date_created_at > '2017-01-01')
+
+data('stop_words')
+bing <- get_sentiments('bing')
+nrc <- get_sentiments('nrc')
+
+legislators %<>%
+  mutate(num_tweets = map_dbl(LastUnique, function(i) nrow(filter(unnested_tweets, lastunique == i))))
+
+party_tweets <- legislators %>% 
+  group_by(Party) %>% 
+  summarize(num_tweets = sum(num_tweets))
+
+gender_party_tweets <- legislators %>% 
+  group_by(Party, Gender) %>% 
+  summarize(num_tweets = sum(num_tweets))
+
+sa <- unnested_tweets %>% 
+  filter(is_retweet == F) %>% 
+  unnest_tokens(word, text) %>% 
+  select(lastunique, word, District, Party, Race, Gender, First.Elected, retweet_count, favorite_count) %>% 
+  anti_join(stop_words) %>% 
+  mutate(bing_sentiment = map_chr(word, function(i) ifelse(i %in% bing$word, bing$sentiment[which(bing$word == i)], NA)),
+         num_tweets = map_dbl(lastunique, function(i) legislators$num_tweets[which(i == legislators$LastUnique)]),
+         nrc_sentiment = map_chr(word, function(i) ifelse(i %in% nrc$word, nrc$sentiment[which(nrc$word == i)], NA)))
+
+sentiment_lollipop <- function(df){
+  ggplot(df, aes(fct_reorder(key, n_scaled), n_scaled, color = col)) +
+    geom_lollipop()  +
+    scale_color_manual(values = col_vec,
+                      breaks = c('Dark Red','Light Red','Dark Blue','Light Blue'),
+                      labels = c('Positive Sentiment - GOP', 'Negative Sentiment - GOP',
+                                 'Positive Sentiment - Dem', 'Negative Sentiment - Dem'),
+                      name = '') +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+}
+
+sentiment_bar <- function(df){
+  ggplot(df, aes(fct_reorder(key, n_scaled), n_scaled, fill = col, label = round(n_scaled, 2))) +
+    geom_bar(stat='identity')  +
+    geom_label(show.legend = F) +
+    scale_fill_manual(values = col_vec,
+                      breaks = c('Dark Red','Light Red','Dark Blue','Light Blue'),
+                      labels = c('Positive Sentiment - GOP', 'Negative Sentiment - GOP',
+                                 'Positive Sentiment - Dem', 'Negative Sentiment - Dem'),
+                      name = '') +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+}
+
+col_vec <- c('Dark Red' = '#de2d26', 'Light Red' = '#fc9272', 
+             'Dark Blue' = '#3182bd', 'Light Blue' = '#9ecae1')
+
+sing_col_vec <- c('Republican' = '#de2d26', 'Democratic' = '#3182bd')
+
+nrc_sentiments_count <- sa %>% 
+  select(word, sentiment = nrc_sentiment) %>% 
+  group_by(sentiment) %>% 
+  filter(!is.na(sentiment)) %>% 
+  count(word, sort = T)
+
+emotion_color <- tibble(emotion = unique(nrc_sentiments_count$sentiment[!is.na(nrc_sentiments_count$sentiment)]) %>% sort(),
+                        color = RColorBrewer::brewer.pal(10, 'Paired'))
+emotion_color_vector <- emotion_color$emotion
+names(emotion_color_vector) <- emotion_color$color
+
+
+```
+
+The women and men who make up the Kentucky legislature use Twitter often to communicate with themselves, their constituents, and Kentuckians as a whole.  I analyzed the tweets of the 112 legislators who use the application for sentiment and usage patterns.  It was fun project!  I learned a lot and I hope you learn something from my work.
+
+## Method!
+
+The Kentucky Legislative Research Commission director, [David Byerman](https://twitter.com/DirectorLRC), manages a list of all the Kentucky legislators who use the twitter application.  When I was a student in the [Code Louisville](https://www.codelouisville.org/) program, I registered a twitter application that I never used.  I repurposed that application to pull data from the twitter API about legislators tweets.
+
+In order to grab the usernames of the legislators, I used the browser-based [Twitter API console](https://dev.twitter.com/rest/tools/console), and then used the R package `rtweet` to pull the timelines of the legislators.  For this exercise, I grabbed only the tweets since January 1, 2017 (the 2017 legislative session started shortly after that).  I pulled the public data about the legislators accounts on August 20, 2017, and last refreshed the timelines of the legislators around 10:00 PM on August 30, 2017.
+
+As always, I used the R language to analyze the data and produce the visualizations seen below. The graphics are mostly faceted by party, which is good for being able to read names, but does result in the loss of some interesting information.  I’m happy to make you custom graphs if you ask nicely.
+
+## Twitter: A Popularity Contest
+
+Politicians, by nature, care about being popular.  It’s how they get elected!  Personally, I think politicians use twitter at rate disproportionate to the population as a whole because the app puts metrics around how popular each person is.  The most important metrics to most people are the number of people who follow your account. (I recently cracked [1,000](https://twitter.com/rkahne) and I was embarrassed about how excited I was).  Here are is how many people follow each member of the legislature: 
+
+```{r followers, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+ky_leg_follow %>% 
+  gather(key = 'key', value = 'num', followers, following) %>% 
+  select(lastunique, Party, key, num) %>% 
+  mutate(color = case_when(
+    Party == 'Republican' & key == 'followers' ~ 'Dark Red',
+    Party == 'Republican' & key == 'following' ~ 'Light Red',
+    Party == 'Democratic' & key == 'followers' ~ 'Dark Blue',
+    Party == 'Democratic' & key == 'following' ~ 'Light Blue'
+  )) %>%
+  filter(key == 'followers') %>% 
+  ggplot(aes(fct_reorder(lastunique, num), num, label = num, fill = color)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, size = 7),
+        legend.position = 'none') +
+  scale_fill_manual(values = col_vec,
+                    breaks = c('Dark Red','Dark Blue'),
+                    labels = c('GOP', 'Dem'),
+                    name = '') +
+  labs(title = 'Total Followers', x = '', y = '') +
+  facet_wrap(~Party, scales = 'free_x', ncol = 1)
+```
+
+Rep. Brandon Reed (R-Hodgenville) is the legislator with the most followers.  Rep. Attica Scott (D-Louisville), is second.  Both of them are Freshmen legislators.  Using a mean, Republicans have a larger average following, 1,449 to 1,346.  However, Democrats have the advantage when we use median to judge the average, 1120 to 985.  
+
+Now, let’s take a look at who is on #TeamFollowBack:
+
+```{r following, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+ky_leg_follow %>% 
+  gather(key = 'key', value = 'num', followers, following) %>% 
+  select(lastunique, Party, key, num) %>% 
+  mutate(color = case_when(
+    Party == 'Republican' & key == 'followers' ~ 'Dark Red',
+    Party == 'Republican' & key == 'following' ~ 'Light Red',
+    Party == 'Democratic' & key == 'followers' ~ 'Dark Blue',
+    Party == 'Democratic' & key == 'following' ~ 'Light Blue'
+  )) %>%
+  filter(key == 'following') %>% 
+  ggplot(aes(fct_reorder(lastunique, num), num, label = num, fill = color)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, size = 7),
+        legend.position = 'none') +
+  scale_fill_manual(values = col_vec,
+                    breaks = c('Dark Red','Dark Blue'),
+                    labels = c('GOP', 'Dem'),
+                    name = '') +
+  labs(title = 'Total Accounts Followed', x = '', y = '') +
+  facet_wrap(~Party, scales = 'free_x', ncol = 1)
+```
+
+Rep. Reed is definitely *NOT* on #TeamFollowBack, as he only follows 253 accounts, 97% fewer than the number that follow him.  However, it’s pretty clear that Democratic women are good listeners -- out of the six Democrats who follow the most accounts, five are women.  Also, Julia Raque Adams is the only Republican woman in the top ten of her caucus using that metric.
+
+## Heavy Users
+
+The twitter API gives us all the tweets from an account, including retweets.  I thought it would be interesting to look at who used twitter the most --  both by writing their own tweets, and by retweeting others.  
+
+```{r tweets and retweets, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+unnested_tweets %>% 
+  group_by(lastunique, Party, is_retweet) %>% 
+  summarize(n=n()) %>% 
+  ggplot(aes(fct_reorder(lastunique, n), n, fill = fct_relevel(as.factor(is_retweet), c(TRUE, FALSE)))) +
+  geom_bar(stat = 'identity') +
+  facet_wrap(~Party, scales = 'free_x', ncol = 1) +
+  scale_fill_brewer(type = 'seq', palette = 2, name = 'Retweet') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = 'Total Tweets Shaded by Retweets',
+       x = '', y = '')
+```
+
+Rep. Scott and Sen. Whitney Westerfield (R-Hopkinsville) (both former guests on [My Old Kentucky Podcast](http://myoldkentuckypodcast.podbean.com/)!) are the heaviest users of twitter overall, with 2,584 and 2,265 tweets since the new year, respectively.  However, when looking at original content only, Rep. Jason Nemes (R-Louisville) and Sen. Reggie Thomas (D-Lexington) are among the heavier users.  These four legislators are the only members who have sent more than 750 original tweets since the beginning of 2017.  The story of retweets is similar to the story about the number of accounts followed: three Democratic women lead their caucus.  
+
+Let’s look at the average by party:
+
+```{r tweets per legislator, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+unnested_tweets %>% 
+  group_by(Party, is_retweet) %>% 
+  summarize(tweets=n()) %>% 
+  left_join(legislators %>% 
+              group_by(Party) %>% 
+              summarize(legislators = n())) %>% 
+  mutate(`Tweets Per Legislator` = tweets / legislators,
+         col = ifelse(Party == 'Democratic', 'Blue', 'Red'),
+         col = ifelse(is_retweet == T, paste('Dark',col),paste('Light',col))) %>% 
+  ggplot(aes(Party, `Tweets Per Legislator`, 
+             fill = col, label = round(`Tweets Per Legislator`,2))) +
+  geom_bar(stat = 'identity') +
+  geom_label(position = 'stack', show.legend = F) +
+  theme_minimal() +
+  scale_fill_manual(values = col_vec,
+                    breaks = c('Dark Red','Light Red','Dark Blue','Light Blue'),
+                    labels = c('Original Content - GOP', 'Retweet - GOP',
+                               'Original Content - Dem', 'Retweet - Dem'),
+                    name = '') +
+  labs(title = 'Total Tweets Per Legislator, By Party')
+```
+
+While Democrats and Republicans have about the same amount of retweets per legislator (`total number of retweets` / `number of caucus members on twitter`), Democrats send significantly more original tweets.  
+
+##  Who Up?
+
+The twitter API gives us access to the exact moment each tweet was sent.  That’s fun.  Let’s take a look at the tweets over time using density plots, and then a density plot of the time of day when each tweet was sent (this one is fun):
+
+```{r tweets over time, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+ggplot(unnested_tweets, aes(x = created_at)) + 
+  scale_y_continuous(labels = scales::comma) +
+  geom_density() +
+  theme_minimal() +
+  theme(axis.text.y = element_blank()) +
+  labs(title = 'Tweets Over Time',
+       subtitle = 'Retweets Included',
+       x = 'Day', y = 'Number of Tweets')
+```
+
+The legislative session kicked off in January, and then, after organizing, took a break for about a month.  Then, they were back in session until March.  This is reflected clearly in this data.  Tweets are on the rise again, though!  It might be about national politics, or the calls for a special session about pensions and tax reform.
+
+```{r tweets by time of day, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+unnested_tweets %>% 
+  mutate(hour = hour(created_at)) %>% 
+  ggplot(aes(x = hour)) +
+  geom_density() +
+  labs(title = 'Tweets by Time of Day',
+       subtitle = 'Retweets Included',
+       x = 'Hour', y = 'Density') +
+  theme_minimal()
+```
+
+Legislators stay up late!  The MOST COMMON time at which tweets were sent was after midnight.  Not until about about 2:30 AM does the tweeting stop!  Y’all need to go to bed.  Nothing good ever happened to an elected official after the bars close.
+
+This is begging to be analyzed by party.  Let’s take a look:
+
+```{r time by party, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+ggplot(unnested_tweets, aes(x = created_at, fill = Party)) + 
+  scale_y_continuous(labels = scales::comma) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values = sing_col_vec) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank()) +
+  labs(title = 'Tweets Over Time by Party',
+       subtitle = 'Retweets Included',
+       x = 'Day', y = 'Number of Tweets')
+
+unnested_tweets %>% 
+  mutate(hour = hour(created_at)) %>% 
+  ggplot(aes(x = hour, fill = Party)) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values = sing_col_vec) +
+  theme_minimal() +
+  labs(title = 'Tweets by Time of Day by Party',
+       x = 'Hour', y = 'Density')
+```
+
+It looks like the peaks and valleys around the legislative session were more pronounced among Democrats.  Democrats also seemed to have a significant bump in tweets during the early summer.
+
+Regarding time of day: it looks like Republicans are the culprits when it comes to who stays up late.  Democrats definitely stay up late as well, but the most common time for Dems to tweet is around noon.  The GOP peaks about 1:00 AM. 
+
+## Sentiment Analysis Using `tidytext`!
+
+Sentiment analysis is a process by which individual words are associated with specific sentiments.  To do this, data analysts utilize lexicons. Lexicons used in sentiment analysis identify words which are inherently positive and negative. These lexicons are the word of researchers (typically in linguistics) who have done the association.  Sentiment analysis allows us to gauge the overall feelings in a piece of writing or group of statements.  By performing this type of analysis, we gain insight into the mood of the writer/speaker/commenter.  **THIS WORK IS INHERENTLY PROBLEMATIC**.  Please know that while you read it, and don’t form your FULL opinion about these legislators using sentiment analysis.  However, I think this kind of work is still really useful!  Let’s first take a look at the sentiment by legislator using the `Bing` lexicon. The [Bing](https://www.cs.uic.edu/~liub/FBS/sentiment-analysis.html) lexicon was developed by Bing Liu (et al) and is a very straightforward positive-negative lexicon.  It includes 6,788 words. 
+
+```{r bing pops, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+sa %>% 
+  group_by(lastunique, bing_sentiment, Party) %>% 
+  dplyr::summarize(n=n()) %>% 
+  filter(!is.na(bing_sentiment)) %>% 
+  mutate(n = map2_dbl(bing_sentiment, n, function(sen, n) ifelse(sen == 'negative', -n, n)),
+         n_scaled = n / map_dbl(lastunique, function(i) legislators$num_tweets[which(i == legislators$LastUnique)]),
+         col = ifelse(Party == 'Democratic', 'Blue', 'Red'),
+         col = ifelse(bing_sentiment == 'positive', paste('Dark',col),paste('Light',col))) %>% 
+  rename(key = lastunique) %>% 
+  sentiment_lollipop() +
+  theme(legend.position = 'none') +
+  labs(title = 'Scaled Sentiment, Original Tweets',
+       x= '', y = '') +
+  facet_wrap(~Party, scales = 'free_x', ncol = 1)
+```
+
+I used the incredible `tidytext` package to do this analysis.  I pulled each word out of all the tweets, and scaled them using the `Bing` lexicon.  Then, I scaled by the number of tweets.  We’ve already done enough analysis on who tweets the most: this shows us on average, which legislators use the most positive and negative words.  The lollipops above 0 represent the usage rate of positive words, while the lollipops below 0 represent the usage rate of negative words. This graph is arranged by net sentiment: `positive` words minus `negative` words.  You can see that Rep. Dennis Horlander and Rep. Mary Lou Marzian (both D-Louisville) have fairly high usage rate of positive words, but are among the most negative Democratic tweeters because of their high rates of negative words.  Meanwhile, Rep. Reed, the legislator with the most followers, is the most positive Republican.  This might help to explain how he has so many followers despite not that many actual tweets.
+
+Let's take a look by party!
+
+```{r scaled sentiment by party, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+sa %>% 
+  group_by(Party, bing_sentiment) %>% 
+  dplyr::summarize(n=n()) %>% 
+  filter(!is.na(bing_sentiment)) %>% 
+  mutate(n = map2_dbl(bing_sentiment, n, function(sen, n) ifelse(sen == 'negative', -n, n)),
+         col = ifelse(Party == 'Democratic', 'Blue', 'Red'),
+         col = ifelse(bing_sentiment == 'positive', paste('Dark',col),paste('Light',col))) %>% 
+  left_join(party_tweets, by = 'Party') %>% 
+  mutate(n_scaled = n / num_tweets) %>% 
+  rename(key = Party) %>% 
+  sentiment_bar() +
+  theme(legend.position = 'none') +
+  labs(title = 'Scaled Sentiment by Party', x = '', y = '')
+```
+
+Republicans are more emotive than Democrats, at least according to Bing, et al.  The GOP has a higher usage rate of negative words AND positive words.  While the GOP is only slightly less negative than the Democrats, their usage rate of positive words is double that of the Democrats.
+
+“Positive” and “Negative” are straightforward, but they aren’t very descriptive.  The other lexicon I used is the [NRC Emotion Lexicon](http://saifmohammad.com/WebPages/lexicons.html).  In addition to positive and negative sentiments, this lexicon also adds eight emotions, which adds a level of specificity into the analysis.  The NRC lexicon includes 13,301 words, which is WAY more than Bing.  The best way to view this is in a treemap:
+
+```{r treeplot, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center'}
+treemap(nrc_sentiments_count, index =c('sentiment', 'word'), vSize = 'n', title = 'Emotions in KY Legislator Tweets')
+```
+
+It looks like the emotions most likely to be expressed by Kentucky legislators are “positive” and “anticipation”.  I think it’s good to have forward looking legislators!  It also appears that emotions that tile towards “positive” such as “trust” and “joy” outnumber those that tilt negative, like “fear” and “disgust”.  
+
+## In Conclusion
+
+I hope you found some of this a little informative!  I enjoyed putting it together.  If you’d like to dig deeper, check out this [shiny app](https://rkahne.shinyapps.io/kyleg_twitter/) I built.  You can drill down to view the twitter behavior of individual legislators!  (I hope they don’t get TOO mad at me -- I’ll take it down if they promise to raise taxes on cigarettes and expand the sales tax to luxury services).  If you want to reach me, please do so at rkahne [at] gmail.com, or, of course, on Twitter [@rkahne](https://twitter.com/rkahne).
